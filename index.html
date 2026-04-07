@@ -267,7 +267,7 @@ canvas{max-height:240px;}
     <div class="issue-grid" id="issue-grid"></div>
     <div style="display:flex;gap:10px;justify-content:flex-end;margin-top:14px;flex-wrap:wrap;">
       <button class="btn-dl" onclick="downloadBulkChanges()" style="background:linear-gradient(135deg,#7030A0,#9B59B6);">📤 Export Bulk Bid Changes</button>
-      <button class="btn-dl" onclick="downloadExcel()">⬇ Download Full Excel Report</button>
+      <button class="btn-dl" id="btn-excel" onclick="downloadExcel()">⬇ Download Full Excel Report</button>
     </div>
   </div>
 
@@ -1838,97 +1838,114 @@ function downloadExcel() {
     return;
   }
 
-  const wb=XLSX.utils.book_new();
-  const cfg=RESULTS.cfg||{};
+  const btn = document.getElementById('btn-excel');
+  const origHtml = btn ? btn.innerHTML : '';
+  if (btn) { btn.disabled = true; btn.innerHTML = '<span class="spin">⟳</span> Building Report...'; }
 
-  function addSheet(data, name) {
-    const ws=data&&data.length ? XLSX.utils.json_to_sheet(data)
-           : XLSX.utils.aoa_to_sheet([['No data found for this category.']]);
-    XLSX.utils.book_append_sheet(wb, ws, name);
-  }
+  // Defer heavy work so the browser repaints the loading state first
+  setTimeout(() => {
+    try {
+      const wb = XLSX.utils.book_new();
+      const cfg = RESULTS.cfg || {};
 
-  // Summary
-  const dp=RESULTS.daypart||{rows:[]};
-  const dpBoost  = dp.rows.filter(r=>r['Bid Adjustment']==='INCREASE');
-  const dpReduce = dp.rows.filter(r=>r['Bid Adjustment']==='DECREASE');
-  const dpPause  = dp.rows.filter(r=>r['Bid Adjustment']==='PAUSE');
+      function addSheet(data, name) {
+        const ws = data && data.length
+          ? XLSX.utils.json_to_sheet(data)
+          : XLSX.utils.aoa_to_sheet([['No data found for this category.']]);
+        // Excel sheet names: max 31 chars, strip chars that break xlsx
+        const safeName = name.replace(/[:\\/?*\[\]]/g, '').slice(0, 31);
+        XLSX.utils.book_append_sheet(wb, ws, safeName);
+      }
 
-  const underperf = RESULTS.underperf||[];
-  const bids      = RESULTS.bids||[];
-  const budget    = RESULTS.budget||[];
-  const structure = RESULTS.structure||[];
-  const sti       = RESULTS.sti||[];
+      // Summary
+      const dp       = RESULTS.daypart || { rows: [] };
+      const dpBoost  = dp.rows.filter(r => r['Bid Adjustment'] === 'INCREASE');
+      const dpReduce = dp.rows.filter(r => r['Bid Adjustment'] === 'DECREASE');
+      const dpPause  = dp.rows.filter(r => r['Bid Adjustment'] === 'PAUSE');
 
-  const sumWs=XLSX.utils.aoa_to_sheet([
-    ['Amazon PPC Audit Report'],
-    ['Generated:', new Date().toLocaleString()],
-    ['Target ACoS %:', cfg.acos],
-    ['Report Type (Day Parting):', dp.rtype||'N/A'],
-    [],
-    ['Category','# Findings','High/Critical'],
-    ['⏰ Day Parting — Increase Periods', dpBoost.length,  ''],
-    ['⏰ Day Parting — Decrease Periods', dpReduce.length, ''],
-    ['⏰ Day Parting — Pause Periods',    dpPause.length,  ''],
-    ['🚫 Underperforming Keywords',  underperf.length, underperf.filter(r=>r.Priority==='HIGH'||r.Priority==='CRITICAL').length],
-    ['💰 Bid Optimization',          bids.length,      bids.filter(r=>r.Priority==='HIGH'||r.Priority==='CRITICAL').length],
-    ['📈 Budget Analysis',           budget.length,    budget.filter(r=>r.Priority==='HIGH'||r.Priority==='CRITICAL').length],
-    ['🏗️ Structure Issues',         structure.length, structure.filter(r=>r.Priority==='HIGH'||r.Priority==='CRITICAL').length],
-    ['🔍 STI Analysis',              sti.length,       sti.filter(r=>r.Priority==='HIGH'||r.Priority==='CRITICAL').length],
-    ['📦 ASIN Analysis',             (RESULTS.asin||[]).length, (RESULTS.asin||[]).filter(r=>r.Priority==='HIGH'||r.Priority==='CRITICAL').length],
-    ['🌱 STR — Harvest Candidates',  (RESULTS.str?.harvest||[]).length, (RESULTS.str?.harvest||[]).filter(r=>r.Priority==='HIGH').length],
-    ['🚫 STR — Negative Suggestions',(RESULTS.str?.negatives||[]).length, (RESULTS.str?.negatives||[]).filter(r=>r.Priority==='HIGH').length],
-    ['📍 Placements',                (RESULTS.placements||[]).length, (RESULTS.placements||[]).filter(r=>r.Priority==='HIGH').length],
-  ]);
-  XLSX.utils.book_append_sheet(wb, sumWs, '📊 Summary');
+      const underperf = RESULTS.underperf || [];
+      const bids      = RESULTS.bids      || [];
+      const budget    = RESULTS.budget    || [];
+      const structure = RESULTS.structure || [];
+      const sti       = RESULTS.sti       || [];
 
-  // Day Parting — full data + recommendations
-  const dpExport = dp.rows.map(r=>({
-    Period: r.Period,
-    Impressions: r.Impressions,
-    Clicks: r.Clicks,
-    'CTR %': r['CTR %'],
-    'Spend ($)': r['Spend ($)'],
-    'Spend Share %': r['Spend Share %'],
-    Orders: r.Orders,
-    'Sales ($)': r['Sales ($)'],
-    'ACoS %': r['ACoS %'],
-    ROAS: r.ROAS,
-    'CVR %': r['CVR %'],
-    'Avg CPC ($)': r['Avg CPC ($)'],
-    'Bid Adjustment': r['Bid Adjustment'],
-    'Adjustment %': r['Adj %']||'',
-  }));
-  addSheet(dpExport,  '⏰ Day Parting');
-  addSheet(underperf, '🚫 Underperforming KWs');
-  addSheet(bids,      '💰 Bid Optimization');
-  addSheet(budget,    '📈 Budget Analysis');
-  addSheet(structure, '🏗️ Structure Issues');
-  addSheet(sti,       '🔍 STI Analysis');
-  addSheet(RESULTS.asin||[],         '📦 ASIN Analysis');
-  addSheet((RESULTS.str||{harvest:[]}).harvest,   '🌱 STR Harvest');
-  addSheet((RESULTS.str||{negatives:[]}).negatives,'🚫 STR Negatives');
-  addSheet(RESULTS.placements||[],   '📍 Placements');
+      const sumWs = XLSX.utils.aoa_to_sheet([
+        ['Amazon PPC Audit Report'],
+        ['Generated:', new Date().toLocaleString()],
+        ['Target ACoS %:', cfg.acos],
+        ['Report Type (Day Parting):', dp.rtype || 'N/A'],
+        [],
+        ['Category', '# Findings', 'High/Critical'],
+        ['Day Parting - Increase Periods', dpBoost.length,  ''],
+        ['Day Parting - Decrease Periods', dpReduce.length, ''],
+        ['Day Parting - Pause Periods',    dpPause.length,  ''],
+        ['Underperforming Keywords',  underperf.length, underperf.filter(r => r.Priority === 'HIGH' || r.Priority === 'CRITICAL').length],
+        ['Bid Optimization',          bids.length,      bids.filter(r => r.Priority === 'HIGH' || r.Priority === 'CRITICAL').length],
+        ['Budget Analysis',           budget.length,    budget.filter(r => r.Priority === 'HIGH' || r.Priority === 'CRITICAL').length],
+        ['Structure Issues',          structure.length, structure.filter(r => r.Priority === 'HIGH' || r.Priority === 'CRITICAL').length],
+        ['STI Analysis',              sti.length,       sti.filter(r => r.Priority === 'HIGH' || r.Priority === 'CRITICAL').length],
+        ['ASIN Analysis',             (RESULTS.asin || []).length, (RESULTS.asin || []).filter(r => r.Priority === 'HIGH' || r.Priority === 'CRITICAL').length],
+        ['STR - Harvest Candidates',  (RESULTS.str?.harvest || []).length,   (RESULTS.str?.harvest || []).filter(r => r.Priority === 'HIGH').length],
+        ['STR - Negative Suggestions',(RESULTS.str?.negatives || []).length, (RESULTS.str?.negatives || []).filter(r => r.Priority === 'HIGH').length],
+        ['Placements',                (RESULTS.placements || []).length,      (RESULTS.placements || []).filter(r => r.Priority === 'HIGH').length],
+      ]);
+      XLSX.utils.book_append_sheet(wb, sumWs, 'Summary');
 
-  // Master action list
-  const strNeg = (RESULTS.str||{negatives:[]}).negatives;
-  const strHarv= (RESULTS.str||{harvest:[]}).harvest;
-  const master=[
-    ...underperf.map(r=>({Priority:r.Priority,Category:'Underperforming KW',Campaign:r.Campaign,'KW/Period':r.Keyword,Action:r.Action,Notes:r.Reason})),
-    ...bids.map(r=>      ({Priority:r.Priority,Category:'Bid Optimization',  Campaign:r.Campaign,'KW/Period':r['Keyword/Target'],Action:r.Action,Notes:r.Reason})),
-    ...budget.map(r=>    ({Priority:r.Priority,Category:'Budget Analysis',   Campaign:r.Campaign,'KW/Period':'',Action:r.Action,Notes:r.Reason})),
-    ...structure.map(r=> ({Priority:r.Priority,Category:'Structure Issue',   Campaign:r.Campaign,'KW/Period':r['Ad Group']||'',Action:r['Recommended Action'],Notes:r.Details})),
-    ...sti.map(r=>       ({Priority:r.Priority,Category:'STI',              Campaign:r['Winner Campaign'],'KW/Period':r.Keyword,Action:r['Recommended Action'],Notes:`$${r['Potential Waste ($)']} potential waste`})),
-    ...dpBoost.map(r=>           ({Priority:'HIGH',Category:'Day Part — Increase',  Campaign:'All','KW/Period':r.Period,Action:`Increase bids by ${Math.abs(r['Adj %']||20)}%`,Notes:`ACoS ${r['ACoS %']}%, ROAS ${r.ROAS}`})),
-    ...dpReduce.map(r=>          ({Priority:'MEDIUM',Category:'Day Part — Decrease',Campaign:'All','KW/Period':r.Period,Action:`Decrease bids by ${Math.abs(r['Adj %']||20)}%`,Notes:`ACoS ${r['ACoS %']}`})),
-    ...dpPause.map(r=>           ({Priority:'HIGH',Category:'Day Part — Pause',     Campaign:'All','KW/Period':r.Period,Action:'Consider pausing / bid rule to 0',Notes:`ACoS ${r['ACoS %']}`})),
-    ...(RESULTS.asin||[]).filter(r=>r.Priority!=='INFO').map(r=>({Priority:r.Priority,Category:'ASIN Analysis',Campaign:r.Campaigns,'KW/Period':r.ASIN,Action:r.Status,Notes:`ACoS ${r['ACoS %']} | Spend $${r['Spend ($)']} | Orders ${r.Orders}`})),
-    ...strHarv.filter(r=>r.Priority==='HIGH'||r.Priority==='MEDIUM').map(r=>({Priority:r.Priority,Category:'STR — Harvest',Campaign:r.Campaign,'KW/Period':r['Search Term'],Action:r.Recommendation,Notes:`Orders ${r.Orders} | ACoS ${r['ACoS %']}`})),
-    ...strNeg.filter(r=>r.Priority==='HIGH'||r.Priority==='MEDIUM').map(r=> ({Priority:r.Priority,Category:'STR — Negative', Campaign:r.Campaign,'KW/Period':r['Search Term'],Action:r.Recommendation,Notes:r.Reason})),
-    ...(RESULTS.placements||[]).filter(r=>r.Priority!=='INFO').map(r=>({Priority:r.Priority,Category:'Placement',Campaign:'All','KW/Period':r.Placement,Action:r['Recommended Action'],Notes:`ACoS ${r['ACoS %']} | Spend $${r['Spend ($)']}`})),
-  ].sort((a,b)=>priOrder(a.Priority)-priOrder(b.Priority));
-  addSheet(master, '✅ Master Action List');
+      // Day Parting sheet
+      const dpExport = dp.rows.map(r => ({
+        Period:           r.Period,
+        Impressions:      r.Impressions,
+        Clicks:           r.Clicks,
+        'CTR %':          r['CTR %'],
+        'Spend ($)':      r['Spend ($)'],
+        'Spend Share %':  r['Spend Share %'],
+        Orders:           r.Orders,
+        'Sales ($)':      r['Sales ($)'],
+        'ACoS %':         r['ACoS %'],
+        ROAS:             r.ROAS,
+        'CVR %':          r['CVR %'],
+        'Avg CPC ($)':    r['Avg CPC ($)'],
+        'Bid Adjustment': r['Bid Adjustment'],
+        'Adjustment %':   r['Adj %'] || '',
+      }));
+      addSheet(dpExport,  'Day Parting');
+      addSheet(underperf, 'Underperforming KWs');
+      addSheet(bids,      'Bid Optimization');
+      addSheet(budget,    'Budget Analysis');
+      addSheet(structure, 'Structure Issues');
+      addSheet(sti,       'STI Analysis');
+      addSheet(RESULTS.asin || [],                               'ASIN Analysis');
+      addSheet((RESULTS.str || { harvest:   [] }).harvest,       'STR Harvest');
+      addSheet((RESULTS.str || { negatives: [] }).negatives,     'STR Negatives');
+      addSheet(RESULTS.placements || [],                         'Placements');
 
-  XLSX.writeFile(wb, `PPC_Audit_${new Date().toISOString().slice(0,10)}.xlsx`);
+      // Master action list
+      const strNeg  = (RESULTS.str || { negatives: [] }).negatives;
+      const strHarv = (RESULTS.str || { harvest:   [] }).harvest;
+      const master = [
+        ...underperf.map(r => ({ Priority: r.Priority, Category: 'Underperforming KW', Campaign: r.Campaign, 'KW/Period': r.Keyword,              Action: r.Action,                 Notes: r.Reason })),
+        ...bids.map(r =>       ({ Priority: r.Priority, Category: 'Bid Optimization',   Campaign: r.Campaign, 'KW/Period': r['Keyword/Target'],     Action: r.Action,                 Notes: r.Reason })),
+        ...budget.map(r =>     ({ Priority: r.Priority, Category: 'Budget Analysis',    Campaign: r.Campaign, 'KW/Period': '',                       Action: r.Action,                 Notes: r.Reason })),
+        ...structure.map(r =>  ({ Priority: r.Priority, Category: 'Structure Issue',    Campaign: r.Campaign, 'KW/Period': r['Ad Group'] || '',       Action: r['Recommended Action'],  Notes: r.Details })),
+        ...sti.map(r =>        ({ Priority: r.Priority, Category: 'STI',               Campaign: r['Winner Campaign'], 'KW/Period': r.Keyword,       Action: r['Recommended Action'],  Notes: `$${r['Potential Waste ($)']} potential waste` })),
+        ...dpBoost.map(r =>    ({ Priority: 'HIGH',     Category: 'Day Part - Increase',Campaign: 'All',      'KW/Period': r.Period,                Action: `Increase bids by ${Math.abs(r['Adj %'] || 20)}%`, Notes: `ACoS ${r['ACoS %']}%, ROAS ${r.ROAS}` })),
+        ...dpReduce.map(r =>   ({ Priority: 'MEDIUM',   Category: 'Day Part - Decrease',Campaign: 'All',      'KW/Period': r.Period,                Action: `Decrease bids by ${Math.abs(r['Adj %'] || 20)}%`, Notes: `ACoS ${r['ACoS %']}` })),
+        ...dpPause.map(r =>    ({ Priority: 'HIGH',     Category: 'Day Part - Pause',   Campaign: 'All',      'KW/Period': r.Period,                Action: 'Consider pausing / bid rule to 0',                Notes: `ACoS ${r['ACoS %']}` })),
+        ...(RESULTS.asin || []).filter(r => r.Priority !== 'INFO').map(r => ({ Priority: r.Priority, Category: 'ASIN Analysis', Campaign: r.Campaigns, 'KW/Period': r.ASIN, Action: r.Status, Notes: `ACoS ${r['ACoS %']} | Spend $${r['Spend ($)']} | Orders ${r.Orders}` })),
+        ...strHarv.filter(r => r.Priority === 'HIGH' || r.Priority === 'MEDIUM').map(r => ({ Priority: r.Priority, Category: 'STR - Harvest',   Campaign: r.Campaign, 'KW/Period': r['Search Term'], Action: r.Recommendation, Notes: `Orders ${r.Orders} | ACoS ${r['ACoS %']}` })),
+        ...strNeg.filter(r =>  r.Priority === 'HIGH' || r.Priority === 'MEDIUM').map(r => ({ Priority: r.Priority, Category: 'STR - Negative',  Campaign: r.Campaign, 'KW/Period': r['Search Term'], Action: r.Recommendation, Notes: r.Reason })),
+        ...(RESULTS.placements || []).filter(r => r.Priority !== 'INFO').map(r => ({ Priority: r.Priority, Category: 'Placement', Campaign: 'All', 'KW/Period': r.Placement, Action: r['Recommended Action'], Notes: `ACoS ${r['ACoS %']} | Spend $${r['Spend ($)']}` })),
+      ].sort((a, b) => priOrder(a.Priority) - priOrder(b.Priority));
+      addSheet(master, 'Master Action List');
+
+      XLSX.writeFile(wb, `PPC_Audit_${new Date().toISOString().slice(0, 10)}.xlsx`);
+    } catch (err) {
+      console.error('Excel export error:', err);
+      alert('Export failed: ' + err.message + '\n\nCheck the browser console for details.');
+    } finally {
+      if (btn) { btn.disabled = false; btn.innerHTML = origHtml; }
+    }
+  }, 80);
 }
 </script>
 </body>
