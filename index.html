@@ -1102,114 +1102,6 @@ function auditSearchTerms(strRows, bulkRows, cfg) {
 }
 
 // ══════════════════════════════════════════════════════
-// AUDIT: N-GRAM ANALYSIS (from Search Term Report)
-// Breaks search terms into 1/2/3-word combinations,
-// aggregates metrics per n-gram and flags each as
-// Target / Scale / Negate / Monitor / Reduce
-// ══════════════════════════════════════════════════════
-function auditNgrams(strRows, cfg) {
-  if (!strRows || !strRows.length) return { unigrams:[], bigrams:[], trigrams:[] };
-
-  // Common stopwords — skip pure-stopword unigrams
-  const STOP = new Set(['the','a','an','and','or','for','in','on','of','to','is','are','with','by','at','from','as','this','that','it','its','i','me','my','we','our','you','your','he','she','they','their','be','been','being','have','has','had','do','does','did','will','would','could','should','may','might','can','shall','not','no','was','were']);
-
-  function tokenize(term) {
-    return term.toLowerCase().replace(/[^a-z0-9\s']/g,'').split(/\s+/).filter(w=>w.length>1);
-  }
-  function getNgrams(tokens, n) {
-    const out=[];
-    for (let i=0; i<=tokens.length-n; i++) out.push(tokens.slice(i,i+n).join(' '));
-    return out;
-  }
-
-  const maps = [{},{},{}]; // [0]=unigrams [1]=bigrams [2]=trigrams
-
-  for (const row of strRows) {
-    const term   = String(gc(row,'search_term',STR_MAP)||'').trim().toLowerCase();
-    if (!term || term.length<2) continue;
-    const tokens = tokenize(term);
-    const spend  = gcn(row,'spend',STR_MAP);
-    const sales  = gcn(row,'sales',STR_MAP);
-    const clicks = gcn(row,'clicks',STR_MAP);
-    const orders = gcn(row,'orders',STR_MAP);
-    const imps   = gcn(row,'impressions',STR_MAP);
-
-    for (let n=1; n<=3; n++) {
-      for (const ngram of getNgrams(tokens, n)) {
-        if (n===1 && STOP.has(ngram)) continue; // skip stopword unigrams
-        const map = maps[n-1];
-        if (!map[ngram]) map[ngram]={ ngram, n, freq:0, imps:0, clicks:0, spend:0, orders:0, sales:0, terms:new Set() };
-        map[ngram].freq++;
-        map[ngram].imps   += imps;
-        map[ngram].clicks += clicks;
-        map[ngram].spend  += spend;
-        map[ngram].orders += orders;
-        map[ngram].sales  += sales;
-        map[ngram].terms.add(term);
-      }
-    }
-  }
-
-  function processMap(map) {
-    return Object.values(map)
-      .filter(d => d.freq>=2 || d.spend>=cfg.minSpend)
-      .map(d => {
-        const acos = safeAcos(d.spend, d.sales);
-        const cvr  = d.clicks>0 ? (d.orders/d.clicks)*100 : null;
-        const ctr  = d.imps>0   ? (d.clicks/d.imps)*100   : null;
-        const cpc  = d.clicks>0 ? d.spend/d.clicks         : null;
-
-        let tag='—', priority='INFO';
-        if (d.spend >= cfg.minSpend) {
-          if (d.orders===0) {
-            tag='🚫 Negate'; priority=d.spend>=cfg.minSpend*3?'HIGH':'MEDIUM';
-          } else if (acos!==null && acos<=cfg.acos*0.7 && d.orders>=2) {
-            tag='🚀 Scale / Target'; priority='HIGH';
-          } else if (acos!==null && acos<=cfg.acos) {
-            tag='✅ Target'; priority='MEDIUM';
-          } else if (acos!==null && acos>=cfg.acos*cfg.mult) {
-            tag='📉 Reduce / Negate'; priority='MEDIUM';
-          } else {
-            tag='👀 Monitor'; priority='LOW';
-          }
-        } else if (d.orders>0) {
-          tag='✅ Target'; priority='LOW';
-        } else {
-          tag='👀 Monitor'; priority='INFO';
-        }
-
-        return {
-          Priority:     priority,
-          'N-gram':     d.ngram,
-          'N':          d.n,
-          'Frequency':  d.freq,
-          '# Terms':    d.terms.size,
-          Impressions:  d.imps,
-          Clicks:       d.clicks,
-          'CTR %':      ctr!==null ? +ctr.toFixed(2) : '—',
-          'Spend ($)':  +d.spend.toFixed(2),
-          Orders:       d.orders,
-          'Sales ($)':  +d.sales.toFixed(2),
-          'ACoS %':     acos===null?'—':(acos>=9999?'∞':+acos.toFixed(1)),
-          'CVR %':      cvr!==null ? +cvr.toFixed(2) : '—',
-          'Avg CPC ($)':cpc!==null ? +cpc.toFixed(2) : '—',
-          Recommendation: tag,
-          _acos:  acos,
-          _spend: d.spend,
-          _freq:  d.freq,
-        };
-      })
-      .sort((a,b)=>priOrder(a.Priority)-priOrder(b.Priority)||b['Spend ($)']-a['Spend ($)']);
-  }
-
-  return {
-    unigrams: processMap(maps[0]),
-    bigrams:  processMap(maps[1]),
-    trigrams: processMap(maps[2]),
-  };
-}
-
-// ══════════════════════════════════════════════════════
 // AUDIT: PLACEMENT ANALYSIS (from Placement Report)
 // ══════════════════════════════════════════════════════
 function auditPlacements(placeRows, cfg) {
@@ -1423,15 +1315,12 @@ async function runAudit() {
   setProgress(91,'Mining search terms...'); await delay(50);
   const str = DATA.str ? auditSearchTerms(DATA.str, DATA.bulk, cfg) : { harvest:[], negatives:[] };
 
-  setProgress(93,'Running N-gram analysis...'); await delay(50);
-  const ngrams = DATA.str ? auditNgrams(DATA.str, cfg) : { unigrams:[], bigrams:[], trigrams:[] };
-
-  setProgress(95,'Analysing placement performance...'); await delay(50);
+  setProgress(94,'Analysing placement performance...'); await delay(50);
   const placements = DATA.place ? auditPlacements(DATA.place, cfg) : [];
 
   setProgress(97,'Building report...'); await delay(50);
 
-  RESULTS = { underperf, bids, budget, structure, sti, daypart, asin, str, ngrams, placements, cfg };
+  RESULTS = { underperf, bids, budget, structure, sti, daypart, asin, str, placements, cfg };
 
   renderResults(RESULTS);
   setProgress(100,'Done!'); await delay(300);
@@ -1461,7 +1350,6 @@ function renderResults(R) {
     { key:'asin',         label:'📦 ASIN Analysis',       color:'green',  count: (R.asin||[]).length },
     { key:'str',          label:'🔎 Search Terms',        color:'orange', count: str.harvest.length + str.negatives.length },
     { key:'placements',   label:'📍 Placements',          color:'purple', count: (R.placements||[]).length },
-    { key:'ngrams',       label:'📊 N-gram Analysis',     color:'blue',   count: (R.ngrams?.unigrams?.length||0)+(R.ngrams?.bigrams?.length||0)+(R.ngrams?.trigrams?.length||0) },
   ];
 
   const total = cats.reduce((s,c)=>s+c.count,0);
@@ -1488,7 +1376,6 @@ function renderResults(R) {
         c.key==='asin'        ? `${asinIssues.length} need attention` :
         c.key==='str'         ? `${str.harvest.length} harvest · ${str.negatives.length} negatives` :
         c.key==='placements'  ? `${placIssues.length} need multiplier adjustment` :
-        c.key==='ngrams'      ? `${R.ngrams?.unigrams?.length||0} words · ${R.ngrams?.bigrams?.length||0} phrases · ${R.ngrams?.trigrams?.length||0} triplets` :
         countByPri([...([R[c.key]||[]])].flat())
       }</div>
     </div>`).join('');
@@ -1506,7 +1393,6 @@ function renderResults(R) {
     { key:'asin',       label:'📦 ASIN Analysis',   badge: (R.asin||[]).length },
     { key:'str',        label:'🔎 Search Terms',    badge: str.harvest.length + str.negatives.length },
     { key:'placements', label:'📍 Placements',      badge: (R.placements||[]).length },
-    { key:'ngrams',     label:'📊 N-gram Analysis', badge: (R.ngrams?.unigrams?.length||0)+(R.ngrams?.bigrams?.length||0)+(R.ngrams?.trigrams?.length||0) },
   ];
 
   document.getElementById('tabs').innerHTML = tabDef.map((t,i)=>`
@@ -1538,9 +1424,8 @@ function switchTab(key, el) {
 
 function renderTab(key, R) {
   const el = document.getElementById('tab-content');
-  if (key === 'dp')     { renderDayPartingTab(R, el); return; }
-  if (key === 'str')    { renderSearchTermsTab(R, el); return; }
-  if (key === 'ngrams') { renderNgramTab(R, el); return; }
+  if (key === 'dp')  { renderDayPartingTab(R, el); return; }
+  if (key === 'str') { renderSearchTermsTab(R, el); return; }
 
   const colsMap = {
     underperf: ['Priority','Keyword','Campaign','Ad Group','Match Type','State','Spend ($)','Clicks','Conversions','ACoS %','Reason','Action'],
@@ -1856,136 +1741,6 @@ function filterSTRTable() {
   if (body) body.innerHTML = filtered.map(r=>renderRow(r,window._strCols||[])).join('');
 }
 
-// ══════════════════════════════════════════════════════
-// N-GRAM TAB RENDER
-// ══════════════════════════════════════════════════════
-function renderNgramTab(R, el) {
-  const ng = R.ngrams || { unigrams:[], bigrams:[], trigrams:[] };
-  const total = ng.unigrams.length + ng.bigrams.length + ng.trigrams.length;
-
-  if (!total) {
-    el.innerHTML=`<div class="empty-state"><span>📊</span>
-      <strong>No Search Term Report uploaded.</strong><br>
-      Upload a Search Term Report to enable N-gram analysis — it breaks your search terms into individual words and phrases so you can spot patterns, find hidden gold keywords, and identify wasteful terms to negate.</div>`;
-    return;
-  }
-
-  if (!window._ngramN) window._ngramN = 1;
-  const n = window._ngramN;
-  const rows = n===1 ? ng.unigrams : (n===2 ? ng.bigrams : ng.trigrams);
-
-  // Sub-tab buttons
-  const subTabHtml = `<div style="display:flex;gap:8px;margin-bottom:16px;align-items:center;flex-wrap:wrap;">
-    ${[1,2,3].map(i=>{
-      const cnt   = i===1 ? ng.unigrams.length : (i===2 ? ng.bigrams.length : ng.trigrams.length);
-      const label = i===1 ? '1-gram (Words)' : (i===2 ? '2-gram (Phrases)' : '3-gram (Triplets)');
-      const active= n===i;
-      return `<button onclick="window._ngramN=${i};renderNgramTab(RESULTS,document.getElementById('tab-content'))"
-        style="padding:7px 18px;border-radius:20px;border:2px solid ${active?'var(--blue)':'#D0D8E4'};
-               background:${active?'var(--blue)':'white'};color:${active?'white':'#444'};font-weight:700;cursor:pointer;font-size:.84rem;">
-        ${label}
-        <span style="background:${active?'rgba(255,255,255,.3)':'var(--orange)'};color:white;border-radius:99px;padding:1px 8px;font-size:.72rem;margin-left:4px;">${cnt}</span>
-      </button>`;
-    }).join('')}
-    <span style="font-size:.76rem;color:#666;margin-left:6px;">Min 2 occurrences or above min-spend threshold</span>
-  </div>`;
-
-  // Insight summary
-  const topScale  = rows.filter(r=>r.Recommendation.includes('Scale')||r.Recommendation.includes('✅')).slice(0,5);
-  const topNegate = rows.filter(r=>r.Recommendation.includes('🚫')).slice(0,5);
-  const insightHtml = (topScale.length||topNegate.length) ? `<div class="insight-box"><p>
-    ${topScale.length  ? `<strong>🚀 Top ${n}-gram${n>1?'s':''} to target:</strong> ${topScale.map(r=>`<em>"${r['N-gram']}"</em> (ACoS ${r['ACoS %']}${r['ACoS %']!=='—'?'%':''})`).join(', ')}. ` : ''}
-    ${topNegate.length ? `<strong>🚫 Wasteful ${n}-gram${n>1?'s':''} to negate:</strong> ${topNegate.map(r=>`<em>"${r['N-gram']}"</em> ($${r['Spend ($)']} spend, 0 orders)`).join(', ')}.` : ''}
-  </p></div>` : '';
-
-  const cols = ['Priority','N-gram','Frequency','# Terms','Impressions','Clicks','CTR %','Spend ($)','Orders','Sales ($)','ACoS %','CVR %','Avg CPC ($)','Recommendation'];
-
-  const filterBar = `<div class="filter-bar">
-    <input type="text" id="ngram-search" placeholder="🔍  Search n-grams..." oninput="filterNgramTable()">
-    <select id="ngram-rec" onchange="filterNgramTable()">
-      <option value="">All Recommendations</option>
-      <option value="Scale">🚀 Scale / Target</option>
-      <option value="✅">✅ Target</option>
-      <option value="🚫">🚫 Negate</option>
-      <option value="📉">📉 Reduce / Negate</option>
-      <option value="👀">👀 Monitor</option>
-    </select>
-    <select id="ngram-sort" onchange="sortNgramTable()">
-      <option value="spend">Sort: Spend ↓</option>
-      <option value="freq">Sort: Frequency ↓</option>
-      <option value="orders">Sort: Orders ↓</option>
-      <option value="acos">Sort: ACoS ↑</option>
-      <option value="cvr">Sort: CVR ↓</option>
-    </select>
-    <span style="font-size:.78rem;color:#888;margin-left:auto;">${rows.length} ${n}-gram${rows.length!==1?'s':''}</span>
-  </div>`;
-
-  el.innerHTML = subTabHtml + insightHtml + filterBar + `<div class="table-wrap"><table>
-    <thead><tr>${cols.map(c=>`<th>${c}</th>`).join('')}</tr></thead>
-    <tbody id="ngram-body">${renderNgramRows(rows, cols)}</tbody>
-  </table></div>`;
-
-  window._ngramRows = rows;
-  window._ngramCols = cols;
-}
-
-function renderNgramRows(rows, cols) {
-  if (!rows.length) return `<tr><td colspan="${cols.length}" style="text-align:center;color:#aaa;padding:30px;">No results match your filters.</td></tr>`;
-  return rows.map(r=>{
-    const cells = cols.map(col=>{
-      let v = r[col];
-      if (col==='Priority') return `<td><span class="badge badge-${v}">${v}</span></td>`;
-      if (col==='N-gram')   return `<td><strong style="color:var(--navy);font-size:.85rem;">${v}</strong></td>`;
-      if (col==='Recommendation') {
-        const color = v.includes('Scale')||v.includes('✅') ? '#00a86b' :
-                      v.includes('🚫')||v.includes('📉')   ? '#C00000' :
-                      v.includes('👀')                      ? '#ED7D31' : '#666';
-        return `<td><span style="font-weight:700;color:${color};white-space:nowrap;">${v}</span></td>`;
-      }
-      if (v===undefined||v===null||v==='—') return `<td style="color:#bbb">—</td>`;
-      if (typeof v==='number') {
-        if (col.includes('($)')) v='$'+v.toFixed(2);
-        else if (col.includes('%')) v=v+'%';
-      }
-      return `<td>${v}</td>`;
-    });
-    return `<tr>${cells.join('')}</tr>`;
-  }).join('');
-}
-
-function filterNgramTable() {
-  const q   = (document.getElementById('ngram-search')?.value||'').toLowerCase();
-  const rec = document.getElementById('ngram-rec')?.value||'';
-  const filtered = (window._ngramRows||[]).filter(r=>{
-    const mq = !q   || String(r['N-gram']||'').toLowerCase().includes(q);
-    const mr = !rec || String(r.Recommendation||'').includes(rec);
-    return mq && mr;
-  });
-  const body = document.getElementById('ngram-body');
-  if (body) body.innerHTML = renderNgramRows(filtered, window._ngramCols||[]);
-}
-
-function sortNgramTable() {
-  const by = document.getElementById('ngram-sort')?.value||'spend';
-  const rows = [...(window._ngramRows||[])];
-  if (by==='spend')  rows.sort((a,b)=>b['Spend ($)']-a['Spend ($)']);
-  if (by==='freq')   rows.sort((a,b)=>b['Frequency']-a['Frequency']);
-  if (by==='orders') rows.sort((a,b)=>b['Orders']-a['Orders']);
-  if (by==='acos')   rows.sort((a,b)=>{
-    const aa = typeof a._acos==='number'?a._acos:99999;
-    const ba = typeof b._acos==='number'?b._acos:99999;
-    return aa-ba;
-  });
-  if (by==='cvr') rows.sort((a,b)=>{
-    const ac=typeof a['CVR %']==='number'?a['CVR %']:-1;
-    const bc=typeof b['CVR %']==='number'?b['CVR %']:-1;
-    return bc-ac;
-  });
-  window._ngramRows = rows;
-  const body = document.getElementById('ngram-body');
-  if (body) body.innerHTML = renderNgramRows(rows, window._ngramCols||[]);
-}
-
 function renderCharts(R, cats) {
   charts.forEach(c=>c.destroy()); charts=[];
   const c1=new Chart(document.getElementById('chart-categories'),{
@@ -2078,6 +1833,11 @@ function downloadBulkChanges() {
 // FULL EXCEL REPORT EXPORT
 // ══════════════════════════════════════════════════════
 function downloadExcel() {
+  if (!RESULTS.underperf) {
+    alert('No audit results found. Please run the audit first by uploading your data and clicking "Run Audit".');
+    return;
+  }
+
   const wb=XLSX.utils.book_new();
   const cfg=RESULTS.cfg||{};
 
@@ -2093,6 +1853,12 @@ function downloadExcel() {
   const dpReduce = dp.rows.filter(r=>r['Bid Adjustment']==='DECREASE');
   const dpPause  = dp.rows.filter(r=>r['Bid Adjustment']==='PAUSE');
 
+  const underperf = RESULTS.underperf||[];
+  const bids      = RESULTS.bids||[];
+  const budget    = RESULTS.budget||[];
+  const structure = RESULTS.structure||[];
+  const sti       = RESULTS.sti||[];
+
   const sumWs=XLSX.utils.aoa_to_sheet([
     ['Amazon PPC Audit Report'],
     ['Generated:', new Date().toLocaleString()],
@@ -2103,18 +1869,15 @@ function downloadExcel() {
     ['⏰ Day Parting — Increase Periods', dpBoost.length,  ''],
     ['⏰ Day Parting — Decrease Periods', dpReduce.length, ''],
     ['⏰ Day Parting — Pause Periods',    dpPause.length,  ''],
-    ['🚫 Underperforming Keywords',  RESULTS.underperf.length, RESULTS.underperf.filter(r=>r.Priority==='HIGH'||r.Priority==='CRITICAL').length],
-    ['💰 Bid Optimization',          RESULTS.bids.length,      RESULTS.bids.filter(r=>r.Priority==='HIGH'||r.Priority==='CRITICAL').length],
-    ['📈 Budget Analysis',           RESULTS.budget.length,    RESULTS.budget.filter(r=>r.Priority==='HIGH'||r.Priority==='CRITICAL').length],
-    ['🏗️ Structure Issues',         RESULTS.structure.length, RESULTS.structure.filter(r=>r.Priority==='HIGH'||r.Priority==='CRITICAL').length],
-    ['🔍 STI Analysis',              RESULTS.sti.length,       RESULTS.sti.filter(r=>r.Priority==='HIGH'||r.Priority==='CRITICAL').length],
+    ['🚫 Underperforming Keywords',  underperf.length, underperf.filter(r=>r.Priority==='HIGH'||r.Priority==='CRITICAL').length],
+    ['💰 Bid Optimization',          bids.length,      bids.filter(r=>r.Priority==='HIGH'||r.Priority==='CRITICAL').length],
+    ['📈 Budget Analysis',           budget.length,    budget.filter(r=>r.Priority==='HIGH'||r.Priority==='CRITICAL').length],
+    ['🏗️ Structure Issues',         structure.length, structure.filter(r=>r.Priority==='HIGH'||r.Priority==='CRITICAL').length],
+    ['🔍 STI Analysis',              sti.length,       sti.filter(r=>r.Priority==='HIGH'||r.Priority==='CRITICAL').length],
     ['📦 ASIN Analysis',             (RESULTS.asin||[]).length, (RESULTS.asin||[]).filter(r=>r.Priority==='HIGH'||r.Priority==='CRITICAL').length],
     ['🌱 STR — Harvest Candidates',  (RESULTS.str?.harvest||[]).length, (RESULTS.str?.harvest||[]).filter(r=>r.Priority==='HIGH').length],
     ['🚫 STR — Negative Suggestions',(RESULTS.str?.negatives||[]).length, (RESULTS.str?.negatives||[]).filter(r=>r.Priority==='HIGH').length],
     ['📍 Placements',                (RESULTS.placements||[]).length, (RESULTS.placements||[]).filter(r=>r.Priority==='HIGH').length],
-    ['📊 N-gram 1-word (Unigrams)',  (RESULTS.ngrams?.unigrams||[]).length, (RESULTS.ngrams?.unigrams||[]).filter(r=>r.Priority==='HIGH').length],
-    ['📊 N-gram 2-word (Bigrams)',   (RESULTS.ngrams?.bigrams||[]).length,  (RESULTS.ngrams?.bigrams||[]).filter(r=>r.Priority==='HIGH').length],
-    ['📊 N-gram 3-word (Trigrams)',  (RESULTS.ngrams?.trigrams||[]).length,  (RESULTS.ngrams?.trigrams||[]).filter(r=>r.Priority==='HIGH').length],
   ]);
   XLSX.utils.book_append_sheet(wb, sumWs, '📊 Summary');
 
@@ -2135,33 +1898,26 @@ function downloadExcel() {
     'Bid Adjustment': r['Bid Adjustment'],
     'Adjustment %': r['Adj %']||'',
   }));
-  addSheet(dpExport, '⏰ Day Parting');
-  addSheet(RESULTS.underperf,  '🚫 Underperforming KWs');
-  addSheet(RESULTS.bids,       '💰 Bid Optimization');
-  addSheet(RESULTS.budget,     '📈 Budget Analysis');
-  addSheet(RESULTS.structure,  '🏗️ Structure Issues');
-  addSheet(RESULTS.sti,        '🔍 STI Analysis');
+  addSheet(dpExport,  '⏰ Day Parting');
+  addSheet(underperf, '🚫 Underperforming KWs');
+  addSheet(bids,      '💰 Bid Optimization');
+  addSheet(budget,    '📈 Budget Analysis');
+  addSheet(structure, '🏗️ Structure Issues');
+  addSheet(sti,       '🔍 STI Analysis');
   addSheet(RESULTS.asin||[],         '📦 ASIN Analysis');
   addSheet((RESULTS.str||{harvest:[]}).harvest,   '🌱 STR Harvest');
   addSheet((RESULTS.str||{negatives:[]}).negatives,'🚫 STR Negatives');
   addSheet(RESULTS.placements||[],   '📍 Placements');
 
-  // N-gram sheets — strip internal _ fields before export
-  const ngramCols = ['Priority','N-gram','N','Frequency','# Terms','Impressions','Clicks','CTR %','Spend ($)','Orders','Sales ($)','ACoS %','CVR %','Avg CPC ($)','Recommendation'];
-  function cleanNgram(rows) { return rows.map(r=>{ const o={}; ngramCols.forEach(c=>{o[c]=r[c]??''}); return o; }); }
-  addSheet(cleanNgram(RESULTS.ngrams?.unigrams||[]), '📊 N-gram 1-word');
-  addSheet(cleanNgram(RESULTS.ngrams?.bigrams||[]),  '📊 N-gram 2-word');
-  addSheet(cleanNgram(RESULTS.ngrams?.trigrams||[]), '📊 N-gram 3-word');
-
   // Master action list
   const strNeg = (RESULTS.str||{negatives:[]}).negatives;
   const strHarv= (RESULTS.str||{harvest:[]}).harvest;
   const master=[
-    ...RESULTS.underperf.map(r=>({Priority:r.Priority,Category:'Underperforming KW',Campaign:r.Campaign,'KW/Period':r.Keyword,Action:r.Action,Notes:r.Reason})),
-    ...RESULTS.bids.map(r=>      ({Priority:r.Priority,Category:'Bid Optimization',  Campaign:r.Campaign,'KW/Period':r['Keyword/Target'],Action:r.Action,Notes:r.Reason})),
-    ...RESULTS.budget.map(r=>    ({Priority:r.Priority,Category:'Budget Analysis',   Campaign:r.Campaign,'KW/Period':'',Action:r.Action,Notes:r.Reason})),
-    ...RESULTS.structure.map(r=> ({Priority:r.Priority,Category:'Structure Issue',   Campaign:r.Campaign,'KW/Period':r['Ad Group']||'',Action:r['Recommended Action'],Notes:r.Details})),
-    ...RESULTS.sti.map(r=>       ({Priority:r.Priority,Category:'STI',              Campaign:r['Winner Campaign'],'KW/Period':r.Keyword,Action:r['Recommended Action'],Notes:`$${r['Potential Waste ($)']} potential waste`})),
+    ...underperf.map(r=>({Priority:r.Priority,Category:'Underperforming KW',Campaign:r.Campaign,'KW/Period':r.Keyword,Action:r.Action,Notes:r.Reason})),
+    ...bids.map(r=>      ({Priority:r.Priority,Category:'Bid Optimization',  Campaign:r.Campaign,'KW/Period':r['Keyword/Target'],Action:r.Action,Notes:r.Reason})),
+    ...budget.map(r=>    ({Priority:r.Priority,Category:'Budget Analysis',   Campaign:r.Campaign,'KW/Period':'',Action:r.Action,Notes:r.Reason})),
+    ...structure.map(r=> ({Priority:r.Priority,Category:'Structure Issue',   Campaign:r.Campaign,'KW/Period':r['Ad Group']||'',Action:r['Recommended Action'],Notes:r.Details})),
+    ...sti.map(r=>       ({Priority:r.Priority,Category:'STI',              Campaign:r['Winner Campaign'],'KW/Period':r.Keyword,Action:r['Recommended Action'],Notes:`$${r['Potential Waste ($)']} potential waste`})),
     ...dpBoost.map(r=>           ({Priority:'HIGH',Category:'Day Part — Increase',  Campaign:'All','KW/Period':r.Period,Action:`Increase bids by ${Math.abs(r['Adj %']||20)}%`,Notes:`ACoS ${r['ACoS %']}%, ROAS ${r.ROAS}`})),
     ...dpReduce.map(r=>          ({Priority:'MEDIUM',Category:'Day Part — Decrease',Campaign:'All','KW/Period':r.Period,Action:`Decrease bids by ${Math.abs(r['Adj %']||20)}%`,Notes:`ACoS ${r['ACoS %']}`})),
     ...dpPause.map(r=>           ({Priority:'HIGH',Category:'Day Part — Pause',     Campaign:'All','KW/Period':r.Period,Action:'Consider pausing / bid rule to 0',Notes:`ACoS ${r['ACoS %']}`})),
