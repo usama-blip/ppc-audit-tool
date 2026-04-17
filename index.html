@@ -267,13 +267,25 @@ canvas{max-height:240px;}
     <div class="issue-grid" id="issue-grid"></div>
     <div style="display:flex;gap:10px;justify-content:flex-end;margin-top:14px;flex-wrap:wrap;">
       <button class="btn-dl" onclick="downloadBulkChanges()" style="background:linear-gradient(135deg,#7030A0,#9B59B6);">📤 Export Bulk Bid Changes</button>
-      <button class="btn-dl" id="btn-excel" onclick="downloadExcel()">⬇ Download Full Excel Report</button>
+      <button class="btn-dl" onclick="downloadExcel()">⬇ Download Full Excel Report</button>
     </div>
   </div>
 
   <div class="chart-row">
     <div class="chart-box"><h4>Issues by Category</h4><canvas id="chart-categories"></canvas></div>
     <div class="chart-box"><h4>Issues by Priority</h4><canvas id="chart-priorities"></canvas></div>
+  </div>
+
+  <div class="card" id="asin-filter-card" style="display:none;padding:14px 24px;">
+    <div style="display:flex;align-items:center;gap:14px;flex-wrap:wrap;">
+      <span style="font-size:.85rem;font-weight:700;color:var(--navy);">🔎 Filter by ASIN:</span>
+      <select id="asin-filter-select" onchange="changeAsinFilter(this.value)"
+        style="border:2px solid var(--blue);border-radius:8px;padding:7px 14px;font-size:.85rem;font-weight:600;color:var(--navy);outline:none;min-width:200px;">
+        <option value="">— All ASINs —</option>
+      </select>
+      <span id="asin-filter-info" style="font-size:.78rem;color:#666;"></span>
+      <button onclick="changeAsinFilter('')" style="margin-left:auto;padding:6px 14px;border:1.5px solid #D0D8E4;border-radius:7px;font-size:.8rem;font-weight:600;cursor:pointer;background:white;color:#444;">✕ Clear Filter</button>
+    </div>
   </div>
 
   <div class="card" style="padding-bottom:0;">
@@ -390,6 +402,39 @@ function fmt$(v)        { return '$'+sn(v).toFixed(2).replace(/\B(?=(\d{3})+(?!\
 function priOrder(p)    { return {CRITICAL:0,HIGH:1,MEDIUM:2,LOW:3,INFO:4}[p]??5; }
 function isNumericId(v) { return /^\d{10,}$/.test(String(v).trim()); } // Amazon IDs are long numeric strings
 
+// Per-row keyword extractor — unlike findCol which resolves ONE column globally,
+// gcAny checks each candidate against THIS specific row, returning the first non-empty value.
+// This fixes SP/SB/SD rows using different column names in the same bulk file.
+function gcAny(row, candidates) {
+  const headers = Object.keys(row);
+  const ID_SUFFIX = /\s+id$/i;
+  for (const c of candidates) {
+    if (row[c] !== undefined && String(row[c]) !== '') return row[c];
+    const ci = headers.find(h => h.trim().toLowerCase() === c.trim().toLowerCase());
+    if (ci && row[ci] !== undefined && String(row[ci]) !== '') return row[ci];
+  }
+  for (const c of candidates) {
+    const cl = c.toLowerCase();
+    const ci = headers.find(h => {
+      const hl = h.toLowerCase();
+      if (ID_SUFFIX.test(hl)) return false;
+      return hl.includes(cl) && row[h] !== undefined && String(row[h]) !== '';
+    });
+    if (ci) return row[ci];
+  }
+  return '';
+}
+
+// Detect SP / SB / SD from the 'Product' column (most reliable) or Entity string
+function detectCamType(prodCol, entityStr) {
+  const p = String(prodCol  || '').toLowerCase();
+  const e = String(entityStr|| '').toLowerCase();
+  if (p.includes('display')  || e.includes('display'))  return 'SD';
+  if (p.includes('brand')    || e.includes('brand'))    return 'SB';
+  if (p.includes('products') || e.includes('products')) return 'SP';
+  return 'SP'; // default
+}
+
 // ACoS helpers — safeAcos returns: null (no data), 9999 (spend > 0 but zero sales = ∞), or normal %
 function safeAcos(spend, sales) {
   if (!spend && !sales) return null;
@@ -411,9 +456,10 @@ function enrichBulkWithNames(rows) {
   if (!rows || !rows.length) return rows;
 
   // ── Step 1: collect ID → Name maps from entity rows ──
-  const campIdToName = {};   // "1234567890" → "SP-Exact-Main"
-  const agIdToName   = {};   // "1234567890" → "AG-ProductA"
-  const agIdToCamp   = {};   // "1234567890" → "SP-Exact-Main"
+  const campIdToName   = {};   // "1234567890" → "SP-Exact-Main"
+  const agIdToName     = {};   // "1234567890" → "AG-ProductA"
+  const agIdToCamp     = {};   // "1234567890" → "SP-Exact-Main"
+  const campNameToType = {};   // "Campaign Name" → "SP"|"SB"|"SD"
 
   // Column name variants for IDs
   const CAMP_ID_COLS = ['Campaign ID','campaign id','CampaignId','campaignId'];
@@ -436,6 +482,9 @@ function enrichBulkWithNames(rows) {
       const id   = getRaw(row, CAMP_ID_COLS);
       const name = String(row['Campaign Name'] || row['Campaign Name (Informational)'] || '').trim();
       if (id && name && !isNumericId(name)) campIdToName[id] = name;
+      // Store campaign type keyed by name
+      const prod = String(row['Product'] || '').toLowerCase();
+      if (name) campNameToType[name] = detectCamType(prod, entity);
     }
 
     // Ad Group entity rows
@@ -479,6 +528,10 @@ function enrichBulkWithNames(rows) {
     const enriched = { ...row };
     if (resolvedCamp) enriched['__CampaignName'] = resolvedCamp;
     if (resolvedAg)   enriched['__AdGroupName']  = resolvedAg;
+    // Inject campaign type (SP / SB / SD)
+    const camType = campNameToType[resolvedCamp]
+      || detectCamType(row['Product']||'', row['Entity']||row['Record Type']||'');
+    enriched['__CamType'] = camType;
     return enriched;
   });
 }
@@ -553,11 +606,13 @@ function auditUnderperforming(bulkRows, cfg) {
   const results = [];
 
   for (const row of bulkRows) {
-    const kw    = String(gc(row,'keyword',BULK_MAP)||'').trim();
+    // gcAny checks each candidate per-row — fixes SP/SB/SD using different keyword columns
+    const kw    = String(gcAny(row, BULK_MAP.keyword)||'').trim();
     const camp  = String(gc(row,'campaign',BULK_MAP)||'').trim();
     const ag    = String(gc(row,'ad_group',BULK_MAP)||'').trim();
     const mt    = String(gc(row,'match_type',BULK_MAP)||'').trim();
     const state = String(gc(row,'state',BULK_MAP)||'').toLowerCase();
+    const camType = String(row['__CamType']||'').trim();
     const spend = gcn(row,'spend',BULK_MAP);
     const orders= gcn(row,'orders',BULK_MAP);
     const sales = gcn(row,'sales',BULK_MAP);
@@ -586,6 +641,7 @@ function auditUnderperforming(bulkRows, cfg) {
     if (priority) {
       results.push({
         Priority: priority,
+        'Cam. Type': camType || 'SP',
         Keyword:  kw,
         Campaign: camp,
         'Ad Group': ag,
@@ -613,11 +669,12 @@ function auditBids(bulkRows, cfg) {
   const MAX = 0.5;
 
   for (const row of bulkRows) {
-    const kw    = String(gc(row,'keyword',BULK_MAP)||'').trim();
+    const kw    = String(gcAny(row, BULK_MAP.keyword)||'').trim();
     const camp  = String(gc(row,'campaign',BULK_MAP)||'').trim();
     const ag    = String(gc(row,'ad_group',BULK_MAP)||'').trim();
     const mt    = String(gc(row,'match_type',BULK_MAP)||'').trim();
     const state = String(gc(row,'state',BULK_MAP)||'').toLowerCase();
+    const camType = String(row['__CamType']||'').trim();
     const bid   = gcn(row,'bid',BULK_MAP);
     const spend = gcn(row,'spend',BULK_MAP);
     const orders= gcn(row,'orders',BULK_MAP);
@@ -666,7 +723,7 @@ function auditBids(bulkRows, cfg) {
     if (action) {
       const chg=newBid ? +((sd(newBid-bid,bid))*100).toFixed(1):0;
       results.push({
-        Priority:priority, 'Keyword/Target':kw, Campaign:camp,
+        Priority:priority, 'Cam. Type':camType||'SP', 'Keyword/Target':kw, Campaign:camp,
         'Ad Group':ag, 'Match Type':mt,
         'Current Bid ($)':bid, 'Spend ($)':+spend.toFixed(2),
         Conversions:orders,
@@ -1102,6 +1159,114 @@ function auditSearchTerms(strRows, bulkRows, cfg) {
 }
 
 // ══════════════════════════════════════════════════════
+// AUDIT: N-GRAM ANALYSIS (from Search Term Report)
+// Breaks search terms into 1/2/3-word combinations,
+// aggregates metrics per n-gram and flags each as
+// Target / Scale / Negate / Monitor / Reduce
+// ══════════════════════════════════════════════════════
+function auditNgrams(strRows, cfg) {
+  if (!strRows || !strRows.length) return { unigrams:[], bigrams:[], trigrams:[] };
+
+  // Common stopwords — skip pure-stopword unigrams
+  const STOP = new Set(['the','a','an','and','or','for','in','on','of','to','is','are','with','by','at','from','as','this','that','it','its','i','me','my','we','our','you','your','he','she','they','their','be','been','being','have','has','had','do','does','did','will','would','could','should','may','might','can','shall','not','no','was','were']);
+
+  function tokenize(term) {
+    return term.toLowerCase().replace(/[^a-z0-9\s']/g,'').split(/\s+/).filter(w=>w.length>1);
+  }
+  function getNgrams(tokens, n) {
+    const out=[];
+    for (let i=0; i<=tokens.length-n; i++) out.push(tokens.slice(i,i+n).join(' '));
+    return out;
+  }
+
+  const maps = [{},{},{}]; // [0]=unigrams [1]=bigrams [2]=trigrams
+
+  for (const row of strRows) {
+    const term   = String(gc(row,'search_term',STR_MAP)||'').trim().toLowerCase();
+    if (!term || term.length<2) continue;
+    const tokens = tokenize(term);
+    const spend  = gcn(row,'spend',STR_MAP);
+    const sales  = gcn(row,'sales',STR_MAP);
+    const clicks = gcn(row,'clicks',STR_MAP);
+    const orders = gcn(row,'orders',STR_MAP);
+    const imps   = gcn(row,'impressions',STR_MAP);
+
+    for (let n=1; n<=3; n++) {
+      for (const ngram of getNgrams(tokens, n)) {
+        if (n===1 && STOP.has(ngram)) continue; // skip stopword unigrams
+        const map = maps[n-1];
+        if (!map[ngram]) map[ngram]={ ngram, n, freq:0, imps:0, clicks:0, spend:0, orders:0, sales:0, terms:new Set() };
+        map[ngram].freq++;
+        map[ngram].imps   += imps;
+        map[ngram].clicks += clicks;
+        map[ngram].spend  += spend;
+        map[ngram].orders += orders;
+        map[ngram].sales  += sales;
+        map[ngram].terms.add(term);
+      }
+    }
+  }
+
+  function processMap(map) {
+    return Object.values(map)
+      .filter(d => d.freq>=2 || d.spend>=cfg.minSpend)
+      .map(d => {
+        const acos = safeAcos(d.spend, d.sales);
+        const cvr  = d.clicks>0 ? (d.orders/d.clicks)*100 : null;
+        const ctr  = d.imps>0   ? (d.clicks/d.imps)*100   : null;
+        const cpc  = d.clicks>0 ? d.spend/d.clicks         : null;
+
+        let tag='—', priority='INFO';
+        if (d.spend >= cfg.minSpend) {
+          if (d.orders===0) {
+            tag='🚫 Negate'; priority=d.spend>=cfg.minSpend*3?'HIGH':'MEDIUM';
+          } else if (acos!==null && acos<=cfg.acos*0.7 && d.orders>=2) {
+            tag='🚀 Scale / Target'; priority='HIGH';
+          } else if (acos!==null && acos<=cfg.acos) {
+            tag='✅ Target'; priority='MEDIUM';
+          } else if (acos!==null && acos>=cfg.acos*cfg.mult) {
+            tag='📉 Reduce / Negate'; priority='MEDIUM';
+          } else {
+            tag='👀 Monitor'; priority='LOW';
+          }
+        } else if (d.orders>0) {
+          tag='✅ Target'; priority='LOW';
+        } else {
+          tag='👀 Monitor'; priority='INFO';
+        }
+
+        return {
+          Priority:     priority,
+          'N-gram':     d.ngram,
+          'N':          d.n,
+          'Frequency':  d.freq,
+          '# Terms':    d.terms.size,
+          Impressions:  d.imps,
+          Clicks:       d.clicks,
+          'CTR %':      ctr!==null ? +ctr.toFixed(2) : '—',
+          'Spend ($)':  +d.spend.toFixed(2),
+          Orders:       d.orders,
+          'Sales ($)':  +d.sales.toFixed(2),
+          'ACoS %':     acos===null?'—':(acos>=9999?'∞':+acos.toFixed(1)),
+          'CVR %':      cvr!==null ? +cvr.toFixed(2) : '—',
+          'Avg CPC ($)':cpc!==null ? +cpc.toFixed(2) : '—',
+          Recommendation: tag,
+          _acos:  acos,
+          _spend: d.spend,
+          _freq:  d.freq,
+        };
+      })
+      .sort((a,b)=>priOrder(a.Priority)-priOrder(b.Priority)||b['Spend ($)']-a['Spend ($)']);
+  }
+
+  return {
+    unigrams: processMap(maps[0]),
+    bigrams:  processMap(maps[1]),
+    trigrams: processMap(maps[2]),
+  };
+}
+
+// ══════════════════════════════════════════════════════
 // AUDIT: PLACEMENT ANALYSIS (from Placement Report)
 // ══════════════════════════════════════════════════════
 function auditPlacements(placeRows, cfg) {
@@ -1315,12 +1480,32 @@ async function runAudit() {
   setProgress(91,'Mining search terms...'); await delay(50);
   const str = DATA.str ? auditSearchTerms(DATA.str, DATA.bulk, cfg) : { harvest:[], negatives:[] };
 
-  setProgress(94,'Analysing placement performance...'); await delay(50);
+  setProgress(93,'Running N-gram analysis...'); await delay(50);
+  const ngrams = DATA.str ? auditNgrams(DATA.str, cfg) : { unigrams:[], bigrams:[], trigrams:[] };
+
+  setProgress(95,'Analysing placement performance...'); await delay(50);
   const placements = DATA.place ? auditPlacements(DATA.place, cfg) : [];
+
+  // Build ASIN → Set of campaign names (from Product Ad rows — most reliable ASIN source)
+  const asinToCamps = {};
+  if (DATA.bulk) {
+    for (const row of DATA.bulk) {
+      const entity = String(row['Entity']||row['Record Type']||row['Type']||'').toLowerCase();
+      if (!entity.includes('product ad') && !entity.includes('ad')) continue;
+      const asinVal = String(
+        row['ASIN']||row['Product ASIN']||row['Advertised ASIN']||row['advertised_asin']||row['asin']||''
+      ).trim().toUpperCase();
+      if (!asinVal || asinVal.length < 4 || asinVal === 'N/A') continue;
+      const campVal = String(row['__CampaignName']||row['Campaign Name']||row['Campaign Name (Informational)']||row['Campaign']||'').trim();
+      if (!campVal) continue;
+      if (!asinToCamps[asinVal]) asinToCamps[asinVal] = new Set();
+      asinToCamps[asinVal].add(campVal);
+    }
+  }
 
   setProgress(97,'Building report...'); await delay(50);
 
-  RESULTS = { underperf, bids, budget, structure, sti, daypart, asin, str, placements, cfg };
+  RESULTS = { underperf, bids, budget, structure, sti, daypart, asin, str, ngrams, placements, asinToCamps, cfg };
 
   renderResults(RESULTS);
   setProgress(100,'Done!'); await delay(300);
@@ -1350,6 +1535,7 @@ function renderResults(R) {
     { key:'asin',         label:'📦 ASIN Analysis',       color:'green',  count: (R.asin||[]).length },
     { key:'str',          label:'🔎 Search Terms',        color:'orange', count: str.harvest.length + str.negatives.length },
     { key:'placements',   label:'📍 Placements',          color:'purple', count: (R.placements||[]).length },
+    { key:'ngrams',       label:'📊 N-gram Analysis',     color:'blue',   count: (R.ngrams?.unigrams?.length||0)+(R.ngrams?.bigrams?.length||0)+(R.ngrams?.trigrams?.length||0) },
   ];
 
   const total = cats.reduce((s,c)=>s+c.count,0);
@@ -1376,9 +1562,32 @@ function renderResults(R) {
         c.key==='asin'        ? `${asinIssues.length} need attention` :
         c.key==='str'         ? `${str.harvest.length} harvest · ${str.negatives.length} negatives` :
         c.key==='placements'  ? `${placIssues.length} need multiplier adjustment` :
+        c.key==='ngrams'      ? `${R.ngrams?.unigrams?.length||0} words · ${R.ngrams?.bigrams?.length||0} phrases · ${R.ngrams?.trigrams?.length||0} triplets` :
         countByPri([...([R[c.key]||[]])].flat())
       }</div>
     </div>`).join('');
+
+  // ── ASIN filter dropdown ──
+  window._asinFilter = '';
+  window._asinToCamps = R.asinToCamps || {};
+  const asinList = Object.keys(R.asinToCamps||{}).sort();
+  const asinCard = document.getElementById('asin-filter-card');
+  const asinSel  = document.getElementById('asin-filter-select');
+  if (asinList.length) {
+    asinSel.innerHTML = '<option value="">— All ASINs —</option>' +
+      asinList.map(a => {
+        const camps = [...(R.asinToCamps[a]||[])];
+        // Detect types in campaigns for this ASIN
+        const types = [...new Set(camps.map(c => {
+          const row = (DATA.bulk||[]).find(r => (r['__CampaignName']||r['Campaign Name']||'')===c);
+          return row ? (row['__CamType']||'SP') : 'SP';
+        }))].join('/');
+        return `<option value="${a}">${a}${types?` (${types})`:''} — ${camps.length} campaign${camps.length!==1?'s':''}</option>`;
+      }).join('');
+    asinCard.style.display = 'block';
+  } else {
+    asinCard.style.display = 'none';
+  }
 
   renderCharts(R, cats);
 
@@ -1393,10 +1602,11 @@ function renderResults(R) {
     { key:'asin',       label:'📦 ASIN Analysis',   badge: (R.asin||[]).length },
     { key:'str',        label:'🔎 Search Terms',    badge: str.harvest.length + str.negatives.length },
     { key:'placements', label:'📍 Placements',      badge: (R.placements||[]).length },
+    { key:'ngrams',     label:'📊 N-gram Analysis', badge: (R.ngrams?.unigrams?.length||0)+(R.ngrams?.bigrams?.length||0)+(R.ngrams?.trigrams?.length||0) },
   ];
 
   document.getElementById('tabs').innerHTML = tabDef.map((t,i)=>`
-    <button class="tab ${i===0?'active':''}" onclick="switchTab('${t.key}',this)">
+    <button class="tab ${i===0?'active':''}" data-key="${t.key}" onclick="switchTab('${t.key}',this)">
       ${t.label} <span class="tab-badge">${t.badge}</span>
       ${t.key==='dp'?'<span class="tag-new">NEW</span>':''}
     </button>`).join('');
@@ -1424,12 +1634,13 @@ function switchTab(key, el) {
 
 function renderTab(key, R) {
   const el = document.getElementById('tab-content');
-  if (key === 'dp')  { renderDayPartingTab(R, el); return; }
-  if (key === 'str') { renderSearchTermsTab(R, el); return; }
+  if (key === 'dp')     { renderDayPartingTab(R, el); return; }
+  if (key === 'str')    { renderSearchTermsTab(R, el); return; }
+  if (key === 'ngrams') { renderNgramTab(R, el); return; }
 
   const colsMap = {
-    underperf: ['Priority','Keyword','Campaign','Ad Group','Match Type','State','Spend ($)','Clicks','Conversions','ACoS %','Reason','Action'],
-    bids:      ['Priority','Keyword/Target','Campaign','Ad Group','Match Type','Current Bid ($)','Spend ($)','Conversions','Current ACoS %','Target ACoS %','New Bid ($)','Bid Change %','Action'],
+    underperf: ['Priority','Cam. Type','Keyword','Campaign','Ad Group','Match Type','State','Spend ($)','Clicks','Conversions','ACoS %','Reason','Action'],
+    bids:      ['Priority','Cam. Type','Keyword/Target','Campaign','Ad Group','Match Type','Current Bid ($)','Spend ($)','Conversions','Current ACoS %','Target ACoS %','New Bid ($)','Bid Change %','Action'],
     budget:    ['Priority','Campaign','Daily Budget ($)','Spend ($)','Budget Used %','ACoS %','Conversions','Recommended Budget ($)','Action','Reason'],
     structure: ['Priority','Issue Type','Campaign','Ad Group','Details','Recommended Action'],
     sti:       ['Priority','Keyword','# Campaigns','Winner Campaign','Winner Match Type','Winner ACoS %','Winner Orders','Competing Campaigns','Potential Waste ($)','Recommended Action'],
@@ -1438,20 +1649,32 @@ function renderTab(key, R) {
   };
 
   const cols = colsMap[key] || [];
-  const rows = key === 'placements' ? (R.placements || []) : (R[key] || []);
+  // Apply ASIN filter (skip for placements/day-parting which are global)
+  const rawRows = key === 'placements' ? (R.placements||[]) : (key==='asin' ? (R.asin||[]) : (R[key]||[]));
+  // For ASIN tab: filter by selected ASIN directly; for others: filter by campaign membership
+  const rows = key==='placements'||key==='budget'||key==='structure' ? rawRows :
+               key==='asin' ? (window._asinFilter ? rawRows.filter(r=>r.ASIN===window._asinFilter) : rawRows) :
+               applyAsinFilter(rawRows);
 
   if (!rows.length) {
     el.innerHTML='<div class="empty-state"><span>✅</span>No issues found in this category — great work!</div>';
     return;
   }
 
+  const hasCamType = cols.includes('Cam. Type');
   const filterBar=`<div class="filter-bar">
     <input type="text" id="tbl-search" placeholder="🔍  Search..." oninput="filterTable()">
     <select id="tbl-pri" onchange="filterTable()">
       <option value="">All Priorities</option>
       <option>CRITICAL</option><option>HIGH</option><option>MEDIUM</option><option>LOW</option><option>INFO</option>
     </select>
-    <span style="font-size:.78rem;color:#888;margin-left:auto;">${rows.length} rows</span>
+    ${hasCamType ? `<select id="tbl-camtype" onchange="filterTable()">
+      <option value="">All Types (SP/SB/SD)</option>
+      <option value="SP">SP — Sponsored Products</option>
+      <option value="SB">SB — Sponsored Brands</option>
+      <option value="SD">SD — Sponsored Display</option>
+    </select>` : ''}
+    <span style="font-size:.78rem;color:#888;margin-left:auto;">${rows.length} rows${window._asinFilter?' · ASIN: '+window._asinFilter:''}</span>
   </div>`;
 
   el.innerHTML = filterBar + `<div class="table-wrap"><table>
@@ -1468,6 +1691,10 @@ function renderRow(row, cols) {
     let v = row[col];
     if (col==='Priority') return `<td><span class="badge badge-${v}">${v}</span></td>`;
     if (col==='Bid Adjustment') return `<td><span class="badge badge-${v}">${v}</span></td>`;
+    if (col==='Cam. Type') {
+      const color = v==='SP'?'#2E75B6':v==='SB'?'#7030A0':v==='SD'?'#375623':'#888';
+      return `<td><span style="background:${color};color:white;border-radius:6px;padding:2px 8px;font-size:.72rem;font-weight:700;">${v||'SP'}</span></td>`;
+    }
     if (v===undefined||v===null||v==='') return `<td style="color:#bbb">—</td>`;
     if (typeof v==='number') {
       const isDollar=col.includes('($)')||col.toLowerCase().includes('bid')||col.toLowerCase().includes('budget');
@@ -1481,12 +1708,14 @@ function renderRow(row, cols) {
 }
 
 function filterTable() {
-  const q=(document.getElementById('tbl-search').value||'').toLowerCase();
-  const pri=document.getElementById('tbl-pri').value;
+  const q      = (document.getElementById('tbl-search')?.value||'').toLowerCase();
+  const pri    = document.getElementById('tbl-pri')?.value||'';
+  const camtype= document.getElementById('tbl-camtype')?.value||'';
   const filtered=(window._curRows||[]).filter(r=>{
-    const mp=!pri||r.Priority===pri;
-    const mt=!q||(window._curCols||[]).some(c=>String(r[c]||'').toLowerCase().includes(q));
-    return mp&&mt;
+    const mp = !pri     || r.Priority === pri;
+    const mc = !camtype || String(r['Cam. Type']||'') === camtype;
+    const mt = !q       || (window._curCols||[]).some(c=>String(r[c]||'').toLowerCase().includes(q));
+    return mp && mc && mt;
   });
   document.getElementById('tbl-body').innerHTML=filtered.map(r=>renderRow(r,window._curCols||[])).join('');
 }
@@ -1741,6 +1970,174 @@ function filterSTRTable() {
   if (body) body.innerHTML = filtered.map(r=>renderRow(r,window._strCols||[])).join('');
 }
 
+// ══════════════════════════════════════════════════════
+// N-GRAM TAB RENDER
+// ══════════════════════════════════════════════════════
+function renderNgramTab(R, el) {
+  const ng = R.ngrams || { unigrams:[], bigrams:[], trigrams:[] };
+  const total = ng.unigrams.length + ng.bigrams.length + ng.trigrams.length;
+
+  if (!total) {
+    el.innerHTML=`<div class="empty-state"><span>📊</span>
+      <strong>No Search Term Report uploaded.</strong><br>
+      Upload a Search Term Report to enable N-gram analysis — it breaks your search terms into individual words and phrases so you can spot patterns, find hidden gold keywords, and identify wasteful terms to negate.</div>`;
+    return;
+  }
+
+  if (!window._ngramN) window._ngramN = 1;
+  const n = window._ngramN;
+  const rows = n===1 ? ng.unigrams : (n===2 ? ng.bigrams : ng.trigrams);
+
+  // Sub-tab buttons
+  const subTabHtml = `<div style="display:flex;gap:8px;margin-bottom:16px;align-items:center;flex-wrap:wrap;">
+    ${[1,2,3].map(i=>{
+      const cnt   = i===1 ? ng.unigrams.length : (i===2 ? ng.bigrams.length : ng.trigrams.length);
+      const label = i===1 ? '1-gram (Words)' : (i===2 ? '2-gram (Phrases)' : '3-gram (Triplets)');
+      const active= n===i;
+      return `<button onclick="window._ngramN=${i};renderNgramTab(RESULTS,document.getElementById('tab-content'))"
+        style="padding:7px 18px;border-radius:20px;border:2px solid ${active?'var(--blue)':'#D0D8E4'};
+               background:${active?'var(--blue)':'white'};color:${active?'white':'#444'};font-weight:700;cursor:pointer;font-size:.84rem;">
+        ${label}
+        <span style="background:${active?'rgba(255,255,255,.3)':'var(--orange)'};color:white;border-radius:99px;padding:1px 8px;font-size:.72rem;margin-left:4px;">${cnt}</span>
+      </button>`;
+    }).join('')}
+    <span style="font-size:.76rem;color:#666;margin-left:6px;">Min 2 occurrences or above min-spend threshold</span>
+  </div>`;
+
+  // Insight summary
+  const topScale  = rows.filter(r=>r.Recommendation.includes('Scale')||r.Recommendation.includes('✅')).slice(0,5);
+  const topNegate = rows.filter(r=>r.Recommendation.includes('🚫')).slice(0,5);
+  const insightHtml = (topScale.length||topNegate.length) ? `<div class="insight-box"><p>
+    ${topScale.length  ? `<strong>🚀 Top ${n}-gram${n>1?'s':''} to target:</strong> ${topScale.map(r=>`<em>"${r['N-gram']}"</em> (ACoS ${r['ACoS %']}${r['ACoS %']!=='—'?'%':''})`).join(', ')}. ` : ''}
+    ${topNegate.length ? `<strong>🚫 Wasteful ${n}-gram${n>1?'s':''} to negate:</strong> ${topNegate.map(r=>`<em>"${r['N-gram']}"</em> ($${r['Spend ($)']} spend, 0 orders)`).join(', ')}.` : ''}
+  </p></div>` : '';
+
+  const cols = ['Priority','N-gram','Frequency','# Terms','Impressions','Clicks','CTR %','Spend ($)','Orders','Sales ($)','ACoS %','CVR %','Avg CPC ($)','Recommendation'];
+
+  const filterBar = `<div class="filter-bar">
+    <input type="text" id="ngram-search" placeholder="🔍  Search n-grams..." oninput="filterNgramTable()">
+    <select id="ngram-rec" onchange="filterNgramTable()">
+      <option value="">All Recommendations</option>
+      <option value="Scale">🚀 Scale / Target</option>
+      <option value="✅">✅ Target</option>
+      <option value="🚫">🚫 Negate</option>
+      <option value="📉">📉 Reduce / Negate</option>
+      <option value="👀">👀 Monitor</option>
+    </select>
+    <select id="ngram-sort" onchange="sortNgramTable()">
+      <option value="spend">Sort: Spend ↓</option>
+      <option value="freq">Sort: Frequency ↓</option>
+      <option value="orders">Sort: Orders ↓</option>
+      <option value="acos">Sort: ACoS ↑</option>
+      <option value="cvr">Sort: CVR ↓</option>
+    </select>
+    <span style="font-size:.78rem;color:#888;margin-left:auto;">${rows.length} ${n}-gram${rows.length!==1?'s':''}</span>
+  </div>`;
+
+  el.innerHTML = subTabHtml + insightHtml + filterBar + `<div class="table-wrap"><table>
+    <thead><tr>${cols.map(c=>`<th>${c}</th>`).join('')}</tr></thead>
+    <tbody id="ngram-body">${renderNgramRows(rows, cols)}</tbody>
+  </table></div>`;
+
+  window._ngramRows = rows;
+  window._ngramCols = cols;
+}
+
+function renderNgramRows(rows, cols) {
+  if (!rows.length) return `<tr><td colspan="${cols.length}" style="text-align:center;color:#aaa;padding:30px;">No results match your filters.</td></tr>`;
+  return rows.map(r=>{
+    const cells = cols.map(col=>{
+      let v = r[col];
+      if (col==='Priority') return `<td><span class="badge badge-${v}">${v}</span></td>`;
+      if (col==='N-gram')   return `<td><strong style="color:var(--navy);font-size:.85rem;">${v}</strong></td>`;
+      if (col==='Recommendation') {
+        const color = v.includes('Scale')||v.includes('✅') ? '#00a86b' :
+                      v.includes('🚫')||v.includes('📉')   ? '#C00000' :
+                      v.includes('👀')                      ? '#ED7D31' : '#666';
+        return `<td><span style="font-weight:700;color:${color};white-space:nowrap;">${v}</span></td>`;
+      }
+      if (v===undefined||v===null||v==='—') return `<td style="color:#bbb">—</td>`;
+      if (typeof v==='number') {
+        if (col.includes('($)')) v='$'+v.toFixed(2);
+        else if (col.includes('%')) v=v+'%';
+      }
+      return `<td>${v}</td>`;
+    });
+    return `<tr>${cells.join('')}</tr>`;
+  }).join('');
+}
+
+function filterNgramTable() {
+  const q   = (document.getElementById('ngram-search')?.value||'').toLowerCase();
+  const rec = document.getElementById('ngram-rec')?.value||'';
+  const filtered = (window._ngramRows||[]).filter(r=>{
+    const mq = !q   || String(r['N-gram']||'').toLowerCase().includes(q);
+    const mr = !rec || String(r.Recommendation||'').includes(rec);
+    return mq && mr;
+  });
+  const body = document.getElementById('ngram-body');
+  if (body) body.innerHTML = renderNgramRows(filtered, window._ngramCols||[]);
+}
+
+function sortNgramTable() {
+  const by = document.getElementById('ngram-sort')?.value||'spend';
+  const rows = [...(window._ngramRows||[])];
+  if (by==='spend')  rows.sort((a,b)=>b['Spend ($)']-a['Spend ($)']);
+  if (by==='freq')   rows.sort((a,b)=>b['Frequency']-a['Frequency']);
+  if (by==='orders') rows.sort((a,b)=>b['Orders']-a['Orders']);
+  if (by==='acos')   rows.sort((a,b)=>{
+    const aa = typeof a._acos==='number'?a._acos:99999;
+    const ba = typeof b._acos==='number'?b._acos:99999;
+    return aa-ba;
+  });
+  if (by==='cvr') rows.sort((a,b)=>{
+    const ac=typeof a['CVR %']==='number'?a['CVR %']:-1;
+    const bc=typeof b['CVR %']==='number'?b['CVR %']:-1;
+    return bc-ac;
+  });
+  window._ngramRows = rows;
+  const body = document.getElementById('ngram-body');
+  if (body) body.innerHTML = renderNgramRows(rows, window._ngramCols||[]);
+}
+
+// ══════════════════════════════════════════════════════
+// ASIN FILTER
+// ══════════════════════════════════════════════════════
+function changeAsinFilter(asin) {
+  window._asinFilter = asin;
+  // Sync dropdown
+  const sel = document.getElementById('asin-filter-select');
+  if (sel) sel.value = asin;
+  // Update info label
+  const info = document.getElementById('asin-filter-info');
+  if (info) {
+    if (asin && window._asinToCamps && window._asinToCamps[asin]) {
+      const camps = [...window._asinToCamps[asin]];
+      info.textContent = `Showing ${camps.length} campaign${camps.length!==1?'s':''}: ${camps.slice(0,3).join(', ')}${camps.length>3?` +${camps.length-3} more`:''}`;
+    } else {
+      info.textContent = '';
+    }
+  }
+  // Re-render current active tab
+  const activeTab = document.querySelector('.tab.active');
+  if (activeTab) {
+    const key = activeTab.getAttribute('data-key');
+    if (key) renderTab(key, RESULTS);
+  }
+}
+
+// Apply ASIN filter to a rows array based on Campaign column
+function applyAsinFilter(rows, campKey) {
+  if (!window._asinFilter || !window._asinToCamps) return rows;
+  const camps = window._asinToCamps[window._asinFilter];
+  if (!camps || !camps.size) return rows;
+  const ck = campKey || 'Campaign';
+  return rows.filter(r => {
+    const c = String(r[ck] || r['Campaign'] || r['Winner Campaign'] || '');
+    return camps.has(c);
+  });
+}
+
 function renderCharts(R, cats) {
   charts.forEach(c=>c.destroy()); charts=[];
   const c1=new Chart(document.getElementById('chart-categories'),{
@@ -1833,132 +2230,101 @@ function downloadBulkChanges() {
 // FULL EXCEL REPORT EXPORT
 // ══════════════════════════════════════════════════════
 function downloadExcel() {
-  if (!RESULTS.underperf) {
-    alert('No audit results found. Please run the audit first by uploading your data and clicking "Run Audit".');
-    return;
+  const wb=XLSX.utils.book_new();
+  const cfg=RESULTS.cfg||{};
+
+  function addSheet(data, name) {
+    const ws=data&&data.length ? XLSX.utils.json_to_sheet(data)
+           : XLSX.utils.aoa_to_sheet([['No data found for this category.']]);
+    XLSX.utils.book_append_sheet(wb, ws, name);
   }
 
-  const btn = document.getElementById('btn-excel');
-  const origHtml = btn ? btn.innerHTML : '';
-  if (btn) { btn.disabled = true; btn.innerHTML = '<span class="spin">⟳</span> Building Report...'; }
+  // Summary
+  const dp=RESULTS.daypart||{rows:[]};
+  const dpBoost  = dp.rows.filter(r=>r['Bid Adjustment']==='INCREASE');
+  const dpReduce = dp.rows.filter(r=>r['Bid Adjustment']==='DECREASE');
+  const dpPause  = dp.rows.filter(r=>r['Bid Adjustment']==='PAUSE');
 
-  // Defer heavy work so the browser repaints the loading state first
-  setTimeout(() => {
-    try {
-      const wb = XLSX.utils.book_new();
-      const cfg = RESULTS.cfg || {};
+  const sumWs=XLSX.utils.aoa_to_sheet([
+    ['Amazon PPC Audit Report'],
+    ['Generated:', new Date().toLocaleString()],
+    ['Target ACoS %:', cfg.acos],
+    ['Report Type (Day Parting):', dp.rtype||'N/A'],
+    [],
+    ['Category','# Findings','High/Critical'],
+    ['⏰ Day Parting — Increase Periods', dpBoost.length,  ''],
+    ['⏰ Day Parting — Decrease Periods', dpReduce.length, ''],
+    ['⏰ Day Parting — Pause Periods',    dpPause.length,  ''],
+    ['🚫 Underperforming Keywords',  RESULTS.underperf.length, RESULTS.underperf.filter(r=>r.Priority==='HIGH'||r.Priority==='CRITICAL').length],
+    ['💰 Bid Optimization',          RESULTS.bids.length,      RESULTS.bids.filter(r=>r.Priority==='HIGH'||r.Priority==='CRITICAL').length],
+    ['📈 Budget Analysis',           RESULTS.budget.length,    RESULTS.budget.filter(r=>r.Priority==='HIGH'||r.Priority==='CRITICAL').length],
+    ['🏗️ Structure Issues',         RESULTS.structure.length, RESULTS.structure.filter(r=>r.Priority==='HIGH'||r.Priority==='CRITICAL').length],
+    ['🔍 STI Analysis',              RESULTS.sti.length,       RESULTS.sti.filter(r=>r.Priority==='HIGH'||r.Priority==='CRITICAL').length],
+    ['📦 ASIN Analysis',             (RESULTS.asin||[]).length, (RESULTS.asin||[]).filter(r=>r.Priority==='HIGH'||r.Priority==='CRITICAL').length],
+    ['🌱 STR — Harvest Candidates',  (RESULTS.str?.harvest||[]).length, (RESULTS.str?.harvest||[]).filter(r=>r.Priority==='HIGH').length],
+    ['🚫 STR — Negative Suggestions',(RESULTS.str?.negatives||[]).length, (RESULTS.str?.negatives||[]).filter(r=>r.Priority==='HIGH').length],
+    ['📍 Placements',                (RESULTS.placements||[]).length, (RESULTS.placements||[]).filter(r=>r.Priority==='HIGH').length],
+    ['📊 N-gram 1-word (Unigrams)',  (RESULTS.ngrams?.unigrams||[]).length, (RESULTS.ngrams?.unigrams||[]).filter(r=>r.Priority==='HIGH').length],
+    ['📊 N-gram 2-word (Bigrams)',   (RESULTS.ngrams?.bigrams||[]).length,  (RESULTS.ngrams?.bigrams||[]).filter(r=>r.Priority==='HIGH').length],
+    ['📊 N-gram 3-word (Trigrams)',  (RESULTS.ngrams?.trigrams||[]).length,  (RESULTS.ngrams?.trigrams||[]).filter(r=>r.Priority==='HIGH').length],
+  ]);
+  XLSX.utils.book_append_sheet(wb, sumWs, '📊 Summary');
 
-      // Excel hard limit: 32,767 chars per cell
-      const CELL_LIMIT = 32000;
-      function truncateRow(row) {
-        const out = {};
-        for (const [k, v] of Object.entries(row)) {
-          out[k] = typeof v === 'string' && v.length > CELL_LIMIT
-            ? v.slice(0, CELL_LIMIT) + '…'
-            : v;
-        }
-        return out;
-      }
+  // Day Parting — full data + recommendations
+  const dpExport = dp.rows.map(r=>({
+    Period: r.Period,
+    Impressions: r.Impressions,
+    Clicks: r.Clicks,
+    'CTR %': r['CTR %'],
+    'Spend ($)': r['Spend ($)'],
+    'Spend Share %': r['Spend Share %'],
+    Orders: r.Orders,
+    'Sales ($)': r['Sales ($)'],
+    'ACoS %': r['ACoS %'],
+    ROAS: r.ROAS,
+    'CVR %': r['CVR %'],
+    'Avg CPC ($)': r['Avg CPC ($)'],
+    'Bid Adjustment': r['Bid Adjustment'],
+    'Adjustment %': r['Adj %']||'',
+  }));
+  addSheet(dpExport, '⏰ Day Parting');
+  addSheet(RESULTS.underperf,  '🚫 Underperforming KWs');
+  addSheet(RESULTS.bids,       '💰 Bid Optimization');
+  addSheet(RESULTS.budget,     '📈 Budget Analysis');
+  addSheet(RESULTS.structure,  '🏗️ Structure Issues');
+  addSheet(RESULTS.sti,        '🔍 STI Analysis');
+  addSheet(RESULTS.asin||[],         '📦 ASIN Analysis');
+  addSheet((RESULTS.str||{harvest:[]}).harvest,   '🌱 STR Harvest');
+  addSheet((RESULTS.str||{negatives:[]}).negatives,'🚫 STR Negatives');
+  addSheet(RESULTS.placements||[],   '📍 Placements');
 
-      function addSheet(data, name) {
-        const safe = data && data.length ? data.map(truncateRow) : null;
-        const ws = safe
-          ? XLSX.utils.json_to_sheet(safe)
-          : XLSX.utils.aoa_to_sheet([['No data found for this category.']]);
-        // Excel sheet names: max 31 chars, strip chars that break xlsx
-        const safeName = name.replace(/[:\\/?*\[\]]/g, '').slice(0, 31);
-        XLSX.utils.book_append_sheet(wb, ws, safeName);
-      }
+  // N-gram sheets — strip internal _ fields before export
+  const ngramCols = ['Priority','N-gram','N','Frequency','# Terms','Impressions','Clicks','CTR %','Spend ($)','Orders','Sales ($)','ACoS %','CVR %','Avg CPC ($)','Recommendation'];
+  function cleanNgram(rows) { return rows.map(r=>{ const o={}; ngramCols.forEach(c=>{o[c]=r[c]??''}); return o; }); }
+  addSheet(cleanNgram(RESULTS.ngrams?.unigrams||[]), '📊 N-gram 1-word');
+  addSheet(cleanNgram(RESULTS.ngrams?.bigrams||[]),  '📊 N-gram 2-word');
+  addSheet(cleanNgram(RESULTS.ngrams?.trigrams||[]), '📊 N-gram 3-word');
 
-      // Summary
-      const dp       = RESULTS.daypart || { rows: [] };
-      const dpBoost  = dp.rows.filter(r => r['Bid Adjustment'] === 'INCREASE');
-      const dpReduce = dp.rows.filter(r => r['Bid Adjustment'] === 'DECREASE');
-      const dpPause  = dp.rows.filter(r => r['Bid Adjustment'] === 'PAUSE');
+  // Master action list
+  const strNeg = (RESULTS.str||{negatives:[]}).negatives;
+  const strHarv= (RESULTS.str||{harvest:[]}).harvest;
+  const master=[
+    ...RESULTS.underperf.map(r=>({Priority:r.Priority,Category:'Underperforming KW',Campaign:r.Campaign,'KW/Period':r.Keyword,Action:r.Action,Notes:r.Reason})),
+    ...RESULTS.bids.map(r=>      ({Priority:r.Priority,Category:'Bid Optimization',  Campaign:r.Campaign,'KW/Period':r['Keyword/Target'],Action:r.Action,Notes:r.Reason})),
+    ...RESULTS.budget.map(r=>    ({Priority:r.Priority,Category:'Budget Analysis',   Campaign:r.Campaign,'KW/Period':'',Action:r.Action,Notes:r.Reason})),
+    ...RESULTS.structure.map(r=> ({Priority:r.Priority,Category:'Structure Issue',   Campaign:r.Campaign,'KW/Period':r['Ad Group']||'',Action:r['Recommended Action'],Notes:r.Details})),
+    ...RESULTS.sti.map(r=>       ({Priority:r.Priority,Category:'STI',              Campaign:r['Winner Campaign'],'KW/Period':r.Keyword,Action:r['Recommended Action'],Notes:`$${r['Potential Waste ($)']} potential waste`})),
+    ...dpBoost.map(r=>           ({Priority:'HIGH',Category:'Day Part — Increase',  Campaign:'All','KW/Period':r.Period,Action:`Increase bids by ${Math.abs(r['Adj %']||20)}%`,Notes:`ACoS ${r['ACoS %']}%, ROAS ${r.ROAS}`})),
+    ...dpReduce.map(r=>          ({Priority:'MEDIUM',Category:'Day Part — Decrease',Campaign:'All','KW/Period':r.Period,Action:`Decrease bids by ${Math.abs(r['Adj %']||20)}%`,Notes:`ACoS ${r['ACoS %']}`})),
+    ...dpPause.map(r=>           ({Priority:'HIGH',Category:'Day Part — Pause',     Campaign:'All','KW/Period':r.Period,Action:'Consider pausing / bid rule to 0',Notes:`ACoS ${r['ACoS %']}`})),
+    ...(RESULTS.asin||[]).filter(r=>r.Priority!=='INFO').map(r=>({Priority:r.Priority,Category:'ASIN Analysis',Campaign:r.Campaigns,'KW/Period':r.ASIN,Action:r.Status,Notes:`ACoS ${r['ACoS %']} | Spend $${r['Spend ($)']} | Orders ${r.Orders}`})),
+    ...strHarv.filter(r=>r.Priority==='HIGH'||r.Priority==='MEDIUM').map(r=>({Priority:r.Priority,Category:'STR — Harvest',Campaign:r.Campaign,'KW/Period':r['Search Term'],Action:r.Recommendation,Notes:`Orders ${r.Orders} | ACoS ${r['ACoS %']}`})),
+    ...strNeg.filter(r=>r.Priority==='HIGH'||r.Priority==='MEDIUM').map(r=> ({Priority:r.Priority,Category:'STR — Negative', Campaign:r.Campaign,'KW/Period':r['Search Term'],Action:r.Recommendation,Notes:r.Reason})),
+    ...(RESULTS.placements||[]).filter(r=>r.Priority!=='INFO').map(r=>({Priority:r.Priority,Category:'Placement',Campaign:'All','KW/Period':r.Placement,Action:r['Recommended Action'],Notes:`ACoS ${r['ACoS %']} | Spend $${r['Spend ($)']}`})),
+  ].sort((a,b)=>priOrder(a.Priority)-priOrder(b.Priority));
+  addSheet(master, '✅ Master Action List');
 
-      const underperf = RESULTS.underperf || [];
-      const bids      = RESULTS.bids      || [];
-      const budget    = RESULTS.budget    || [];
-      const structure = RESULTS.structure || [];
-      const sti       = RESULTS.sti       || [];
-
-      const sumWs = XLSX.utils.aoa_to_sheet([
-        ['Amazon PPC Audit Report'],
-        ['Generated:', new Date().toLocaleString()],
-        ['Target ACoS %:', cfg.acos],
-        ['Report Type (Day Parting):', dp.rtype || 'N/A'],
-        [],
-        ['Category', '# Findings', 'High/Critical'],
-        ['Day Parting - Increase Periods', dpBoost.length,  ''],
-        ['Day Parting - Decrease Periods', dpReduce.length, ''],
-        ['Day Parting - Pause Periods',    dpPause.length,  ''],
-        ['Underperforming Keywords',  underperf.length, underperf.filter(r => r.Priority === 'HIGH' || r.Priority === 'CRITICAL').length],
-        ['Bid Optimization',          bids.length,      bids.filter(r => r.Priority === 'HIGH' || r.Priority === 'CRITICAL').length],
-        ['Budget Analysis',           budget.length,    budget.filter(r => r.Priority === 'HIGH' || r.Priority === 'CRITICAL').length],
-        ['Structure Issues',          structure.length, structure.filter(r => r.Priority === 'HIGH' || r.Priority === 'CRITICAL').length],
-        ['STI Analysis',              sti.length,       sti.filter(r => r.Priority === 'HIGH' || r.Priority === 'CRITICAL').length],
-        ['ASIN Analysis',             (RESULTS.asin || []).length, (RESULTS.asin || []).filter(r => r.Priority === 'HIGH' || r.Priority === 'CRITICAL').length],
-        ['STR - Harvest Candidates',  (RESULTS.str?.harvest || []).length,   (RESULTS.str?.harvest || []).filter(r => r.Priority === 'HIGH').length],
-        ['STR - Negative Suggestions',(RESULTS.str?.negatives || []).length, (RESULTS.str?.negatives || []).filter(r => r.Priority === 'HIGH').length],
-        ['Placements',                (RESULTS.placements || []).length,      (RESULTS.placements || []).filter(r => r.Priority === 'HIGH').length],
-      ]);
-      XLSX.utils.book_append_sheet(wb, sumWs, 'Summary');
-
-      // Day Parting sheet
-      const dpExport = dp.rows.map(r => ({
-        Period:           r.Period,
-        Impressions:      r.Impressions,
-        Clicks:           r.Clicks,
-        'CTR %':          r['CTR %'],
-        'Spend ($)':      r['Spend ($)'],
-        'Spend Share %':  r['Spend Share %'],
-        Orders:           r.Orders,
-        'Sales ($)':      r['Sales ($)'],
-        'ACoS %':         r['ACoS %'],
-        ROAS:             r.ROAS,
-        'CVR %':          r['CVR %'],
-        'Avg CPC ($)':    r['Avg CPC ($)'],
-        'Bid Adjustment': r['Bid Adjustment'],
-        'Adjustment %':   r['Adj %'] || '',
-      }));
-      addSheet(dpExport,  'Day Parting');
-      addSheet(underperf, 'Underperforming KWs');
-      addSheet(bids,      'Bid Optimization');
-      addSheet(budget,    'Budget Analysis');
-      addSheet(structure, 'Structure Issues');
-      addSheet(sti,       'STI Analysis');
-      addSheet(RESULTS.asin || [],                               'ASIN Analysis');
-      addSheet((RESULTS.str || { harvest:   [] }).harvest,       'STR Harvest');
-      addSheet((RESULTS.str || { negatives: [] }).negatives,     'STR Negatives');
-      addSheet(RESULTS.placements || [],                         'Placements');
-
-      // Master action list
-      const strNeg  = (RESULTS.str || { negatives: [] }).negatives;
-      const strHarv = (RESULTS.str || { harvest:   [] }).harvest;
-      const master = [
-        ...underperf.map(r => ({ Priority: r.Priority, Category: 'Underperforming KW', Campaign: r.Campaign, 'KW/Period': r.Keyword,              Action: r.Action,                 Notes: r.Reason })),
-        ...bids.map(r =>       ({ Priority: r.Priority, Category: 'Bid Optimization',   Campaign: r.Campaign, 'KW/Period': r['Keyword/Target'],     Action: r.Action,                 Notes: r.Reason })),
-        ...budget.map(r =>     ({ Priority: r.Priority, Category: 'Budget Analysis',    Campaign: r.Campaign, 'KW/Period': '',                       Action: r.Action,                 Notes: r.Reason })),
-        ...structure.map(r =>  ({ Priority: r.Priority, Category: 'Structure Issue',    Campaign: r.Campaign, 'KW/Period': r['Ad Group'] || '',       Action: r['Recommended Action'],  Notes: r.Details })),
-        ...sti.map(r =>        ({ Priority: r.Priority, Category: 'STI',               Campaign: r['Winner Campaign'], 'KW/Period': r.Keyword,       Action: r['Recommended Action'],  Notes: `$${r['Potential Waste ($)']} potential waste` })),
-        ...dpBoost.map(r =>    ({ Priority: 'HIGH',     Category: 'Day Part - Increase',Campaign: 'All',      'KW/Period': r.Period,                Action: `Increase bids by ${Math.abs(r['Adj %'] || 20)}%`, Notes: `ACoS ${r['ACoS %']}%, ROAS ${r.ROAS}` })),
-        ...dpReduce.map(r =>   ({ Priority: 'MEDIUM',   Category: 'Day Part - Decrease',Campaign: 'All',      'KW/Period': r.Period,                Action: `Decrease bids by ${Math.abs(r['Adj %'] || 20)}%`, Notes: `ACoS ${r['ACoS %']}` })),
-        ...dpPause.map(r =>    ({ Priority: 'HIGH',     Category: 'Day Part - Pause',   Campaign: 'All',      'KW/Period': r.Period,                Action: 'Consider pausing / bid rule to 0',                Notes: `ACoS ${r['ACoS %']}` })),
-        ...(RESULTS.asin || []).filter(r => r.Priority !== 'INFO').map(r => ({ Priority: r.Priority, Category: 'ASIN Analysis', Campaign: r.Campaigns, 'KW/Period': r.ASIN, Action: r.Status, Notes: `ACoS ${r['ACoS %']} | Spend $${r['Spend ($)']} | Orders ${r.Orders}` })),
-        ...strHarv.filter(r => r.Priority === 'HIGH' || r.Priority === 'MEDIUM').map(r => ({ Priority: r.Priority, Category: 'STR - Harvest',   Campaign: r.Campaign, 'KW/Period': r['Search Term'], Action: r.Recommendation, Notes: `Orders ${r.Orders} | ACoS ${r['ACoS %']}` })),
-        ...strNeg.filter(r =>  r.Priority === 'HIGH' || r.Priority === 'MEDIUM').map(r => ({ Priority: r.Priority, Category: 'STR - Negative',  Campaign: r.Campaign, 'KW/Period': r['Search Term'], Action: r.Recommendation, Notes: r.Reason })),
-        ...(RESULTS.placements || []).filter(r => r.Priority !== 'INFO').map(r => ({ Priority: r.Priority, Category: 'Placement', Campaign: 'All', 'KW/Period': r.Placement, Action: r['Recommended Action'], Notes: `ACoS ${r['ACoS %']} | Spend $${r['Spend ($)']}` })),
-      ].sort((a, b) => priOrder(a.Priority) - priOrder(b.Priority));
-      addSheet(master, 'Master Action List');
-
-      XLSX.writeFile(wb, `PPC_Audit_${new Date().toISOString().slice(0, 10)}.xlsx`);
-    } catch (err) {
-      console.error('Excel export error:', err);
-      alert('Export failed: ' + err.message + '\n\nCheck the browser console for details.');
-    } finally {
-      if (btn) { btn.disabled = false; btn.innerHTML = origHtml; }
-    }
-  }, 80);
+  XLSX.writeFile(wb, `PPC_Audit_${new Date().toISOString().slice(0,10)}.xlsx`);
 }
 </script>
 </body>
